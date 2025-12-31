@@ -186,6 +186,7 @@ class LetThemCook:
         watch_mode: bool = False,
         passive: bool = False,
         aggressive: bool = True,
+        relentless: bool = False,
         model: str = "sonnet",
         max_turns: int = 0,
     ):
@@ -193,6 +194,7 @@ class LetThemCook:
         self.watch_mode = watch_mode
         self.passive = passive
         self.aggressive = aggressive
+        self.relentless = relentless  # Never stop, no [DONE]
         self.model = model
         self.max_turns = max_turns
         self.gemini = GeminiClient()
@@ -386,17 +388,29 @@ class LetThemCook:
             for m in recent
         ])
 
-        aggressive_note = """
+        if self.relentless:
+            # Relentless mode - NEVER stop
+            mode_note = """
+CRITICAL: You are in RELENTLESS mode. You must NEVER say [DONE]. NEVER.
+Always find the next thing to improve, implement, test, or optimize.
+If the task seems complete, find edge cases, add tests, improve error handling,
+add documentation, optimize performance, or start on related improvements.
+There is ALWAYS something more to do. Keep pushing forward indefinitely.
+"""
+        elif self.aggressive:
+            mode_note = """
 IMPORTANT: This is an OPEN-ENDED, ITERATIVE task. Push for CONTINUOUS improvement.
 Do NOT say [DONE] unless Claude explicitly cannot continue or needs specific user input.
 Always push for the NEXT improvement, NEXT implementation, NEXT iteration.
 Ask Claude to IMPLEMENT changes, not just explain them.
-""" if self.aggressive else ""
+"""
+        else:
+            mode_note = ""
 
         prompt = f"""You are the cook in "Let Them Cook" - driving Claude Code through tasks.
 
 ORIGINAL TASK: {original_task}
-{aggressive_note}
+{mode_note}
 Claude's latest response:
 ---
 {claude_response[:2000]}
@@ -417,6 +431,12 @@ Rules:
 Your response (next instruction, or [DONE]):"""
 
         response = self.gemini.analyze(prompt, max_tokens=500)
+
+        # In relentless mode, never stop - generate fallback if needed
+        if self.relentless:
+            if "[DONE]" in response or not response:
+                response = "Good progress. Now review what we've built and identify the next improvement - whether it's error handling, tests, performance, documentation, or edge cases. Pick one and implement it."
+            return response.strip()
 
         if "[DONE]" in response or not response:
             return None
@@ -481,12 +501,16 @@ Your response:"""
 
     async def run_drive_mode(self, initial_task: str):
         """Drive Claude through a task autonomously"""
+        mode_name = "Relentless Mode" if self.relentless else "Drive Mode"
         print(f"\n{C.CYAN}{'═' * 60}")
-        print(f"🍳 LET THEM COOK - Drive Mode")
+        print(f"🍳 LET THEM COOK - {mode_name}")
         print(f"{'═' * 60}{C.RESET}")
         print(f"{C.INFO}Claude: {C.CLAUDE}{self.model}{C.RESET} {C.INFO}| Gemini: {C.COOK}{self.gemini.model_name if self.gemini.available else 'off'}{C.RESET}")
         max_str = "unlimited" if self.max_turns == 0 else str(self.max_turns)
-        print(f"{C.INFO}Max turns: {max_str} | Aggressive: {self.aggressive}{C.RESET}")
+        if self.relentless:
+            print(f"{C.INFO}Max turns: {max_str} | {C.ERROR}RELENTLESS (never stops){C.RESET}")
+        else:
+            print(f"{C.INFO}Max turns: {max_str} | Aggressive: {self.aggressive}{C.RESET}")
         print(f"\n{C.DIM}Press Ctrl+C to take over{C.RESET}")
         print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
 
@@ -722,6 +746,8 @@ async def main():
                         help="Passive mode - watch only, don't intervene")
     parser.add_argument("--no-aggressive", action="store_true",
                         help="Less aggressive - only act when necessary")
+    parser.add_argument("--relentless", "-r", action="store_true",
+                        help="Relentless mode - never stop, always find more to do")
     parser.add_argument("-m", "--model", default="sonnet",
                         help="Claude model to use")
     parser.add_argument("--max-turns", type=int, default=0,
@@ -738,6 +764,7 @@ async def main():
         watch_mode=args.watch,
         passive=args.passive,
         aggressive=not args.no_aggressive,
+        relentless=args.relentless,
         model=args.model,
         max_turns=args.max_turns,
     )
