@@ -29,7 +29,7 @@ Autonomous Claude + Gemini collaboration. Two AI agents cooking together.
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/let-them-cook.git
+git clone https://github.com/friday-james/let-them-cook.git
 cd let-them-cook
 
 pip install -r requirements.txt
@@ -47,21 +47,24 @@ chmod +x let_them_cook.py
 Gemini actively drives Claude through tasks:
 
 ```bash
-# Give it a task and let them cook
 ./let_them_cook.py "Build a REST API with user authentication"
+```
 
-# Less aggressive - stops when task seems done
-./let_them_cook.py --no-aggressive "Fix the login bug"
+### Relentless Mode
+Never stops. Always finds more to do - tests, edge cases, optimizations, docs:
+
+```bash
+./let_them_cook.py -r "Build a CLI tool"
 ```
 
 ### Watch Mode
 Tail an existing Claude session and chime in when needed:
 
 ```bash
-# In one terminal: run Claude Code
+# Terminal 1: run Claude Code
 claude
 
-# In another terminal: watch and intervene
+# Terminal 2: watch and intervene
 ./let_them_cook.py --watch
 ```
 
@@ -77,16 +80,38 @@ Start without a task, you drive:
 
 ```bash
 ./let_them_cook.py
-# Type commands, use /auto to let Gemini take over
 ```
+
+## Interrupting & Joining
+
+Press `Ctrl+C` anytime to take over:
+
+```
+[cook:auto] implementing auth...
+
+^C  ← you interrupt
+
+────────────────────────────────
+YOUR TURN
+/stay  - Stay in interactive mode
+/quit  - Exit
+────────────────────────────────
+
+[you] focus on the login flow first
+
+[cook] [auto-resuming...]  ← automatically continues
+```
+
+Your message is sent, then it auto-resumes. Use `/stay` to keep driving manually.
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
 | `task` | Task to drive Claude through |
-| `--watch, -w` | Watch mode - tail existing session |
-| `--passive, -p` | Passive mode - watch only |
+| `-r, --relentless` | Never stop, always find more to do |
+| `-w, --watch` | Watch mode - tail existing session |
+| `-p, --passive` | Passive mode - watch only |
 | `--no-aggressive` | Less aggressive - stop when task seems done |
 | `-m, --model` | Claude model (default: sonnet) |
 | `--max-turns` | Max turns, 0 = unlimited (default: 0) |
@@ -95,9 +120,9 @@ Start without a task, you drive:
 
 | Command | Description |
 |---------|-------------|
-| `/auto` | Let Gemini take over |
+| `/stay` | Stay in interactive mode (don't auto-resume) |
 | `/quit` | Exit |
-| `Ctrl+C` | Interrupt and switch to interactive |
+| `Ctrl+C` | Interrupt and take over |
 
 ## Output Colors
 
@@ -113,10 +138,10 @@ Start without a task, you drive:
 
 ```
 ════════════════════════════════════════════════════════════
-🍳 LET THEM COOK - Drive Mode
+🍳 LET THEM COOK - Relentless Mode
 ════════════════════════════════════════════════════════════
 Claude: sonnet | Gemini: gemini-2.0-flash
-Max turns: unlimited | Aggressive: True
+Max turns: unlimited | RELENTLESS (never stops)
 
 Press Ctrl+C to take over
 ════════════════════════════════════════════════════════════
@@ -137,7 +162,12 @@ Press Ctrl+C to take over
 ────────────────────────────────────────────────────────────
 [claude] I'll add JWT authentication with bcrypt...
 [tool] Edit: {"file_path": "/api/auth.py"...}
-...
+[done] success | $0.0156 | 8420ms
+────────────────────────────────────────────────────────────
+
+[cook:auto] Now add input validation and error handling...
+
+... continues indefinitely until Ctrl+C ...
 ```
 
 ## Requirements
