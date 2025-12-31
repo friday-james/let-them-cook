@@ -637,11 +637,11 @@ Your response:"""
     # Interactive Mode
     # -------------------------------------------------------------------------
 
-    async def interactive_mode(self, last_response: str = ""):
-        """Interactive mode - user controls, can switch back to auto"""
+    async def interactive_mode(self, last_response: str = "", auto_resume: bool = True):
+        """Interactive mode - user inputs a message, then auto resumes"""
         print(f"\n{C.GREEN}{'─' * 40}")
-        print(f"INTERACTIVE MODE")
-        print(f"{C.DIM}/auto  - Resume autonomous mode")
+        print(f"YOUR TURN")
+        print(f"{C.DIM}/stay  - Stay in interactive mode")
         print(f"/quit  - Exit{C.RESET}")
         print(f"{C.GREEN}{'─' * 40}{C.RESET}\n")
 
@@ -661,13 +661,20 @@ Your response:"""
                     print(f"{C.DIM}[goodbye]{C.RESET}")
                     break
 
-                if user_input == "/auto":
-                    print(f"{C.COOK}[resuming autonomous mode...]{C.RESET}")
-                    await self.continue_autonomous(last_response)
-                    return
+                if user_input == "/stay":
+                    auto_resume = False
+                    print(f"{C.DIM}[staying in interactive mode]{C.RESET}")
+                    continue
 
+                # Send to Claude
                 response = await self.send_to_claude(user_input)
                 last_response = response
+
+                # Auto-resume autonomous mode after user input
+                if auto_resume:
+                    print(f"{C.COOK}[auto-resuming...]{C.RESET}")
+                    await self.continue_autonomous(last_response)
+                    return
 
             except KeyboardInterrupt:
                 print(f"\n{C.DIM}[exiting]{C.RESET}")
@@ -741,14 +748,14 @@ async def main():
         elif args.task:
             await cook.run_drive_mode(args.task)
         else:
-            # No task - start interactive
+            # No task - start interactive (no auto-resume since no task yet)
             print(f"\n{C.CYAN}{'═' * 60}")
             print(f"🍳 LET THEM COOK - Interactive Mode")
             print(f"{'═' * 60}{C.RESET}")
             print(f"{C.INFO}Claude: {C.CLAUDE}{cook.model}{C.RESET}")
-            print(f"{C.DIM}/auto - Let cook take over | /quit - Exit{C.RESET}")
+            print(f"{C.DIM}Type a task to start, /quit to exit{C.RESET}")
             print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
-            await cook.interactive_mode()
+            await cook.interactive_mode(auto_resume=False)
 
     except KeyboardInterrupt:
         print(f"\n{C.YELLOW}[stopped]{C.RESET}")
