@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Let Them Cook - Autonomous Claude Code Watcher
+Let Them Cook - Autonomous Claude + Gemini Collaboration
 
-Watches Claude Code's session in real-time and chimes in when needed.
-Works like a pair programmer watching over your shoulder.
+Two AI agents cooking together:
+- Gemini (cook) drives the direction and decides next steps
+- Claude Code executes, writes code, uses tools
+- User can interrupt and join anytime
 
-How it works:
-1. Tails Claude Code's session JSONL file
-2. Analyzes each response from Claude
-3. Decides if it should chime in with guidance
-4. Sends follow-up messages using --continue
+Modes:
+1. Drive mode (default): Gemini actively drives Claude through tasks
+2. Watch mode: Tail existing session and chime in when needed
 
 Usage:
-    ./let_them_cook.py                      # Watch current session
-    ./let_them_cook.py --task "Build API"   # Start with a task
-    ./let_them_cook.py --passive            # Only watch, don't intervene
+    ./let_them_cook.py "Build a REST API"         # Drive Claude through task
+    ./let_them_cook.py --watch                    # Watch existing session
+    ./let_them_cook.py --passive                  # Watch only, don't intervene
 """
 
 import asyncio
@@ -22,7 +22,6 @@ import json
 import os
 import sys
 import shutil
-import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -62,7 +61,7 @@ class C:
 # =============================================================================
 
 class GeminiClient:
-    """Gemini client for deciding when to chime in"""
+    """Gemini client for driving Claude and deciding when to chime in"""
 
     def __init__(self, model: str = "gemini-2.0-flash"):
         self.model_name = model
@@ -93,7 +92,7 @@ class GeminiClient:
 
 
 # =============================================================================
-# SESSION WATCHER
+# SESSION UTILITIES
 # =============================================================================
 
 @dataclass
@@ -169,32 +168,266 @@ def parse_session_line(line: str) -> Optional[Message]:
     return None
 
 
-class SessionWatcher:
-    """Watches Claude Code session and decides when to intervene"""
+# =============================================================================
+# LET THEM COOK - MAIN CLASS
+# =============================================================================
+
+class LetThemCook:
+    """
+    Autonomous Claude + Gemini collaboration.
+
+    Gemini (cook) drives Claude through tasks, or watches and chimes in.
+    User can interrupt and take over anytime.
+    """
 
     def __init__(
         self,
         task: str = None,
+        watch_mode: bool = False,
         passive: bool = False,
         aggressive: bool = True,
         model: str = "sonnet",
+        max_turns: int = 0,
     ):
         self.task = task
+        self.watch_mode = watch_mode
         self.passive = passive
         self.aggressive = aggressive
         self.model = model
+        self.max_turns = max_turns
         self.gemini = GeminiClient()
         self.conversation: List[Message] = []
         self.last_position = 0
         self.running = False
         self.session_file: Optional[Path] = None
 
+    # -------------------------------------------------------------------------
+    # Streaming Output
+    # -------------------------------------------------------------------------
+
+    def _print_stream_event(self, line: str):
+        """Parse and print a stream-json event with colors"""
+        try:
+            data = json.loads(line)
+            event_type = data.get("type", "unknown")
+
+            if event_type == "system":
+                subtype = data.get("subtype", "")
+                if subtype == "init":
+                    model = data.get("model", "unknown")
+                    print(f"{C.DIM}[init] model={model}{C.RESET}", flush=True)
+
+            elif event_type == "assistant":
+                msg = data.get("message", {})
+                content_blocks = msg.get("content", [])
+                for block in content_blocks:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text = block.get("text", "")
+                            print(f"{C.CLAUDE}{C.BOLD}[claude]{C.RESET} {C.CLAUDE}{text}{C.RESET}", flush=True)
+                        elif block.get("type") == "tool_use":
+                            tool_name = block.get("name", "unknown")
+                            tool_input = block.get("input", {})
+                            input_preview = json.dumps(tool_input)[:150]
+                            print(f"{C.TOOL}[tool] {C.BOLD}{tool_name}{C.RESET}{C.TOOL}: {input_preview}{C.RESET}", flush=True)
+
+            elif event_type == "tool_result":
+                content = data.get("content", "")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")[:300]
+                            print(f"{C.RESULT}[result] {text}...{C.RESET}", flush=True)
+                elif isinstance(content, str):
+                    print(f"{C.RESULT}[result] {content[:300]}...{C.RESET}", flush=True)
+
+            elif event_type == "result":
+                subtype = data.get("subtype", "")
+                cost = data.get("total_cost_usd", 0)
+                duration = data.get("duration_ms", 0)
+                color = C.SUCCESS if subtype == "success" else C.ERROR
+                print(f"{color}[done] {subtype} | ${cost:.4f} | {duration}ms{C.RESET}", flush=True)
+
+            elif event_type == "error":
+                msg = data.get('error', {}).get('message', 'Unknown')
+                print(f"{C.ERROR}[error] {msg}{C.RESET}", flush=True)
+
+        except json.JSONDecodeError:
+            if line.strip():
+                print(f"{C.DIM}[raw] {line[:200]}{C.RESET}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Send to Claude (Drive Mode)
+    # -------------------------------------------------------------------------
+
+    async def send_to_claude(self, message: str, continue_session: bool = True) -> str:
+        """Send a message to Claude Code and stream everything"""
+        cmd = [
+            CLAUDE_BIN,
+            "-p",
+            "--model", self.model,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+
+        if continue_session:
+            cmd.append("--continue")
+
+        cmd.append(message)
+
+        print(f"\n{C.DIM}{'─'*60}{C.RESET}", flush=True)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            return f"[ERROR] Failed to start Claude: {e}"
+
+        full_response = ""
+        buffer = ""
+
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(256),
+                        timeout=0.3
+                    )
+                    if chunk:
+                        buffer += chunk.decode('utf-8', errors='replace')
+
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            if line.strip():
+                                self._print_stream_event(line)
+                                try:
+                                    data = json.loads(line)
+                                    if data.get("type") == "assistant":
+                                        msg = data.get("message", {})
+                                        for block in msg.get("content", []):
+                                            if isinstance(block, dict) and block.get("type") == "text":
+                                                full_response += block.get("text", "") + "\n"
+                                    elif data.get("type") == "result":
+                                        result = data.get("result", "")
+                                        if result and not full_response:
+                                            full_response = result
+                                except:
+                                    pass
+
+                    elif process.returncode is not None:
+                        break
+                except asyncio.TimeoutError:
+                    if process.returncode is not None:
+                        break
+                    continue
+
+        except asyncio.CancelledError:
+            process.kill()
+            print("\n[interrupted]")
+            raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            process.kill()
+            print("\n[interrupted]")
+            raise
+
+        await process.wait()
+        print(f"{C.DIM}{'─'*60}{C.RESET}\n", flush=True)
+
+        response = full_response.strip() if full_response else "[no text response]"
+
+        # Also read from JSONL for complete response
+        session_file = get_latest_session_file()
+        if session_file:
+            self.session_file = session_file
+            try:
+                with open(session_file) as f:
+                    for line in f:
+                        pass  # Go to last line
+                    f.seek(0)
+                    lines = f.readlines()
+                    if lines:
+                        last_msg = parse_session_line(lines[-1])
+                        if last_msg and last_msg.role == "assistant":
+                            if len(last_msg.content) > len(response):
+                                response = last_msg.content
+            except:
+                pass
+
+        # Store in conversation
+        self.conversation.append(Message(
+            role="user", content=message, timestamp=datetime.now().isoformat()
+        ))
+        self.conversation.append(Message(
+            role="assistant", content=response, timestamp=datetime.now().isoformat()
+        ))
+
+        return response
+
+    # -------------------------------------------------------------------------
+    # Gemini Decision Making
+    # -------------------------------------------------------------------------
+
+    def should_continue(self, claude_response: str) -> Optional[str]:
+        """Ask Gemini if/what to send next to Claude"""
+        if not self.gemini.available:
+            return None
+
+        original_task = self.task or (
+            self.conversation[0].content if self.conversation else "unknown"
+        )
+
+        recent = self.conversation[-6:]
+        context = "\n".join([
+            f"{m.role.upper()}: {m.content[:500]}"
+            for m in recent
+        ])
+
+        aggressive_note = """
+IMPORTANT: This is an OPEN-ENDED, ITERATIVE task. Push for CONTINUOUS improvement.
+Do NOT say [DONE] unless Claude explicitly cannot continue or needs specific user input.
+Always push for the NEXT improvement, NEXT implementation, NEXT iteration.
+Ask Claude to IMPLEMENT changes, not just explain them.
+""" if self.aggressive else ""
+
+        prompt = f"""You are the cook in "Let Them Cook" - driving Claude Code through tasks.
+
+ORIGINAL TASK: {original_task}
+{aggressive_note}
+Claude's latest response:
+---
+{claude_response[:2000]}
+---
+
+Recent conversation:
+{context}
+
+What should you tell Claude next?
+
+Rules:
+1. If Claude says it CANNOT continue or needs specific user input: Output [DONE]
+2. Otherwise: Output your next instruction to push the task forward
+3. Be specific and actionable
+4. Ask for implementations, not explanations
+5. Push for the next step/improvement
+
+Your response (next instruction, or [DONE]):"""
+
+        response = self.gemini.analyze(prompt, max_tokens=500)
+
+        if "[DONE]" in response or not response:
+            return None
+
+        return response.strip()
+
     def should_chime_in(self, latest_message: Message) -> Optional[str]:
-        """Ask Gemini if we should send a follow-up"""
+        """Ask Gemini if we should chime in (watch mode)"""
         if self.passive or not self.gemini.available:
             return None
 
-        # Build context
         recent = self.conversation[-6:]
         context = "\n".join([
             f"{m.role.upper()}: {m.content[:400]}"
@@ -242,32 +475,74 @@ Your response:"""
 
         return response.strip()
 
-    async def send_to_claude(self, message: str):
-        """Send a message to Claude using --continue"""
-        cmd = [
-            CLAUDE_BIN,
-            "-p",
-            "--model", self.model,
-            "--dangerously-skip-permissions",
-            "--continue",
-            message
-        ]
+    # -------------------------------------------------------------------------
+    # Drive Mode (Autonomous)
+    # -------------------------------------------------------------------------
 
-        print(f"\n{C.COOK}{C.BOLD}[cook]{C.RESET} {C.COOK}{message}{C.RESET}\n")
+    async def run_drive_mode(self, initial_task: str):
+        """Drive Claude through a task autonomously"""
+        print(f"\n{C.CYAN}{'═' * 60}")
+        print(f"🍳 LET THEM COOK - Drive Mode")
+        print(f"{'═' * 60}{C.RESET}")
+        print(f"{C.INFO}Claude: {C.CLAUDE}{self.model}{C.RESET} {C.INFO}| Gemini: {C.COOK}{self.gemini.model_name if self.gemini.available else 'off'}{C.RESET}")
+        max_str = "unlimited" if self.max_turns == 0 else str(self.max_turns)
+        print(f"{C.INFO}Max turns: {max_str} | Aggressive: {self.aggressive}{C.RESET}")
+        print(f"\n{C.DIM}Press Ctrl+C to take over{C.RESET}")
+        print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        self.running = True
+        self.task = initial_task
 
-        stdout, stderr = await process.communicate()
-        response = stdout.decode('utf-8', errors='replace').strip()
+        # Send initial task
+        print(f"{C.COOK}{C.BOLD}[cook]{C.RESET} {C.COOK}{initial_task}{C.RESET}\n")
 
-        print(f"{C.DIM}[sent - Claude will respond in session]{C.RESET}\n")
+        try:
+            response = await self.send_to_claude(initial_task, continue_session=False)
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}[interrupted] Exiting.{C.RESET}")
+            return
 
-    async def tail_session(self):
-        """Tail the session file and react to new messages"""
+        # Autonomous loop
+        turn = 0
+        while self.running and (self.max_turns == 0 or turn < self.max_turns):
+            turn += 1
+
+            try:
+                next_message = self.should_continue(response)
+
+                if not next_message:
+                    print(f"\n{C.COOK}[cook]{C.RESET} {C.INFO}Task complete or needs user input.{C.RESET}")
+                    await self.interactive_mode(response)
+                    return
+
+                print(f"\n{C.COOK}{C.BOLD}[cook:auto]{C.RESET} {C.COOK}{next_message}{C.RESET}\n")
+
+                await asyncio.sleep(2)
+                response = await self.send_to_claude(next_message)
+
+            except KeyboardInterrupt:
+                print(f"\n\n{C.YELLOW}[interrupted] Switching to interactive mode...{C.RESET}")
+                await self.interactive_mode(response)
+                return
+
+        print(f"\n{C.INFO}[loop] Finished after {turn} turns{C.RESET}")
+
+    # -------------------------------------------------------------------------
+    # Watch Mode (Tail Session)
+    # -------------------------------------------------------------------------
+
+    async def run_watch_mode(self):
+        """Watch existing Claude session and chime in when needed"""
+        print(f"\n{C.CYAN}{'═' * 60}")
+        print(f"🍳 LET THEM COOK - Watch Mode")
+        print(f"{'═' * 60}{C.RESET}")
+        print(f"{C.INFO}Mode: {'Passive (watch only)' if self.passive else 'Active (will chime in)'}{C.RESET}")
+        print(f"{C.INFO}Gemini: {C.COOK}{self.gemini.model_name if self.gemini.available else 'off'}{C.RESET}")
+        print(f"\n{C.DIM}Press Ctrl+C to stop{C.RESET}")
+        print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
+
+        self.running = True
+
         print(f"{C.INFO}[watcher] Looking for session file...{C.RESET}")
 
         # Wait for session file
@@ -303,21 +578,24 @@ Your response:"""
                     msg = parse_session_line(line)
                     if msg:
                         self.conversation.append(msg)
-                        await self.handle_message(msg)
+                        await self.handle_watch_message(msg)
 
                 await asyncio.sleep(0.5)
 
+            except KeyboardInterrupt:
+                break
             except Exception as e:
                 print(f"{C.ERROR}[watcher:error] {e}{C.RESET}")
                 await asyncio.sleep(1)
 
-    async def handle_message(self, msg: Message):
-        """Handle a new message from the session"""
+        print(f"\n{C.YELLOW}[stopped]{C.RESET}")
+
+    async def handle_watch_message(self, msg: Message):
+        """Handle a new message in watch mode"""
         if msg.role == "user":
             print(f"{C.GREEN}[user]{C.RESET} {msg.content[:100]}{'...' if len(msg.content) > 100 else ''}")
 
         elif msg.role == "assistant":
-            # Show Claude's response
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     print(f"{C.TOOL}[tool] {tc['name']}{C.RESET}")
@@ -330,22 +608,21 @@ Your response:"""
             if not self.passive:
                 chime = self.should_chime_in(msg)
                 if chime:
-                    await asyncio.sleep(2)  # Brief pause
-                    await self.send_to_claude(chime)
+                    await asyncio.sleep(2)
+                    await self.send_chime(chime)
 
-    async def start_task(self, task: str):
-        """Start Claude with an initial task"""
-        self.task = task
-
+    async def send_chime(self, message: str):
+        """Send a chime-in message to Claude (watch mode)"""
         cmd = [
             CLAUDE_BIN,
             "-p",
             "--model", self.model,
             "--dangerously-skip-permissions",
-            task
+            "--continue",
+            message
         ]
 
-        print(f"{C.COOK}{C.BOLD}[cook]{C.RESET} {C.COOK}Starting: {task}{C.RESET}\n")
+        print(f"\n{C.COOK}{C.BOLD}[cook]{C.RESET} {C.COOK}{message}{C.RESET}\n")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -353,48 +630,95 @@ Your response:"""
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Don't wait for completion - just start it
-        # The tail will pick up the response
+        await process.communicate()
+        print(f"{C.DIM}[sent - Claude will respond in session]{C.RESET}\n")
 
-    async def run(self):
-        """Main run loop"""
-        print(f"\n{C.CYAN}{'═' * 60}")
-        print(f"🍳 LET THEM COOK - Autonomous Watcher")
-        print(f"{'═' * 60}{C.RESET}")
-        print(f"{C.INFO}Mode: {'Passive (watch only)' if self.passive else 'Active (will chime in)'}{C.RESET}")
-        print(f"{C.INFO}Model: {C.CLAUDE}{self.model}{C.RESET}")
-        print(f"{C.INFO}Gemini: {C.COOK}{self.gemini.model_name if self.gemini.available else 'off'}{C.RESET}")
-        print(f"\n{C.DIM}Press Ctrl+C to stop{C.RESET}")
-        print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
+    # -------------------------------------------------------------------------
+    # Interactive Mode
+    # -------------------------------------------------------------------------
 
-        self.running = True
+    async def interactive_mode(self, last_response: str = ""):
+        """Interactive mode - user controls, can switch back to auto"""
+        print(f"\n{C.GREEN}{'─' * 40}")
+        print(f"INTERACTIVE MODE")
+        print(f"{C.DIM}/auto  - Resume autonomous mode")
+        print(f"/quit  - Exit{C.RESET}")
+        print(f"{C.GREEN}{'─' * 40}{C.RESET}\n")
 
-        try:
-            # Start initial task if provided
-            if self.task:
-                await self.start_task(self.task)
+        loop = asyncio.get_event_loop()
+
+        while True:
+            try:
+                user_input = await loop.run_in_executor(
+                    None, lambda: input(f"{C.GREEN}[you]{C.RESET} ")
+                )
+                user_input = user_input.strip()
+
+                if not user_input:
+                    continue
+
+                if user_input == "/quit":
+                    print(f"{C.DIM}[goodbye]{C.RESET}")
+                    break
+
+                if user_input == "/auto":
+                    print(f"{C.COOK}[resuming autonomous mode...]{C.RESET}")
+                    await self.continue_autonomous(last_response)
+                    return
+
+                response = await self.send_to_claude(user_input)
+                last_response = response
+
+            except KeyboardInterrupt:
+                print(f"\n{C.DIM}[exiting]{C.RESET}")
+                break
+            except EOFError:
+                break
+
+    async def continue_autonomous(self, last_response: str):
+        """Continue autonomous from current state"""
+        turn = 0
+        while self.max_turns == 0 or turn < self.max_turns:
+            turn += 1
+
+            try:
+                next_msg = self.should_continue(last_response)
+
+                if not next_msg:
+                    print(f"{C.COOK}[cook]{C.RESET} {C.INFO}Done - returning to interactive{C.RESET}")
+                    await self.interactive_mode(last_response)
+                    return
+
+                print(f"\n{C.COOK}{C.BOLD}[cook:auto]{C.RESET} {C.COOK}{next_msg}{C.RESET}\n")
                 await asyncio.sleep(2)
 
-            # Start tailing
-            await self.tail_session()
+                last_response = await self.send_to_claude(next_msg)
 
-        except KeyboardInterrupt:
-            print(f"\n{C.YELLOW}[stopped]{C.RESET}")
-        finally:
-            self.running = False
+            except KeyboardInterrupt:
+                print(f"\n{C.YELLOW}[interrupted]{C.RESET}")
+                await self.interactive_mode(last_response)
+                return
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 async def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Let Them Cook - Claude Watcher")
-    parser.add_argument("--task", "-t", help="Initial task to start")
+    parser = argparse.ArgumentParser(description="Let Them Cook - Claude + Gemini Collaboration")
+    parser.add_argument("task", nargs="?", help="Task to drive Claude through")
+    parser.add_argument("--watch", "-w", action="store_true",
+                        help="Watch mode - tail existing session")
     parser.add_argument("--passive", "-p", action="store_true",
                         help="Passive mode - watch only, don't intervene")
     parser.add_argument("--no-aggressive", action="store_true",
-                        help="Less aggressive - only chime in when necessary")
+                        help="Less aggressive - only act when necessary")
     parser.add_argument("-m", "--model", default="sonnet",
                         help="Claude model to use")
+    parser.add_argument("--max-turns", type=int, default=0,
+                        help="Max turns, 0 = unlimited")
 
     args = parser.parse_args()
 
@@ -402,14 +726,32 @@ async def main():
         print(f"{C.ERROR}[!] Claude Code not found{C.RESET}")
         sys.exit(1)
 
-    watcher = SessionWatcher(
+    cook = LetThemCook(
         task=args.task,
+        watch_mode=args.watch,
         passive=args.passive,
         aggressive=not args.no_aggressive,
         model=args.model,
+        max_turns=args.max_turns,
     )
 
-    await watcher.run()
+    try:
+        if args.watch or args.passive:
+            await cook.run_watch_mode()
+        elif args.task:
+            await cook.run_drive_mode(args.task)
+        else:
+            # No task - start interactive
+            print(f"\n{C.CYAN}{'═' * 60}")
+            print(f"🍳 LET THEM COOK - Interactive Mode")
+            print(f"{'═' * 60}{C.RESET}")
+            print(f"{C.INFO}Claude: {C.CLAUDE}{cook.model}{C.RESET}")
+            print(f"{C.DIM}/auto - Let cook take over | /quit - Exit{C.RESET}")
+            print(f"{C.CYAN}{'═' * 60}{C.RESET}\n")
+            await cook.interactive_mode()
+
+    except KeyboardInterrupt:
+        print(f"\n{C.YELLOW}[stopped]{C.RESET}")
 
 
 if __name__ == "__main__":
